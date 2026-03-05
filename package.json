@@ -1,0 +1,29 @@
+{
+  "name": "idos-arb-bot",
+  "version": "1.0.0",
+  "description": "IDOS arbitrage bot: KuCoin (CEX) <-> Uniswap V3 on Arbitrum (DEX)",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "tsx src/index.ts",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "dependencies": {
+    "kucoin-api": "^1.0.5",
+    "ethers": "^6.13.0",
+    "@uniswap/v3-sdk": "^3.13.1",
+    "@uniswap/sdk-core": "^5.9.0",
+    "express": "^4.21.0",
+    "dotenv": "^16.4.5",
+    "winston": "^3.14.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.6.0",
+    "tsx": "^4.19.0",
+    "@types/express": "^4.17.21",
+    "@types/node": "^20.14.0",
+    "vitest": "^2.1.0"
+  }
+}

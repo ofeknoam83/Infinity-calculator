@@ -1,0 +1,40 @@
+services:
+  - type: worker
+    name: idos-arb-bot
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    region: ohio
+    plan: starter
+    envVars:
+      - key: KUCOIN_API_KEY
+        sync: false
+      - key: KUCOIN_API_SECRET
+        sync: false
+      - key: KUCOIN_API_PASSPHRASE
+        sync: false
+      - key: ARBITRUM_PRIVATE_KEY
+        sync: false
+      - key: ARBITRUM_RPC_URL
+        sync: false
+      - key: MIN_PROFIT_USD
+        value: "0.50"
+      - key: MIN_PROFIT_PCT
+        value: "0.5"
+      - key: MAX_TRADE_SIZE_IDOS
+        value: "10000"
+      - key: TRADE_COOLDOWN_MS
+        value: "5000"
+      - key: MAX_SLIPPAGE_PCT
+        value: "1.0"
+      - key: USE_PRIVATE_RPC
+        value: "false"
+      - key: DASHBOARD_PORT
+        value: "3000"
+      - key: DASHBOARD_API_KEY
+        sync: false
+      - key: RECOVERY_STRATEGY
+        value: "unwind"
+      - key: MAX_LOSS_USD
+        value: "5.00"
+      - key: LOG_LEVEL
+        value: "info"
