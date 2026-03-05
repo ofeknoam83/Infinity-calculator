@@ -64,7 +64,7 @@ export const config = {
 
   // Dashboard
   dashboard: {
-    port: parseInt(optionalEnv('DASHBOARD_PORT', '3000')),
+    port: parseInt(process.env['PORT'] || optionalEnv('DASHBOARD_PORT', '3000')),
     apiKey: process.env['DASHBOARD_API_KEY'] || '',
   },
 
