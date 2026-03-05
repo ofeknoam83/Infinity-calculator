@@ -26,22 +26,38 @@ export class FeeCalculator {
   ): FeeBreakdown {
     const tradeValueUsd = tradeSizeIdos * ((buyPriceUsd + sellPriceUsd) / 2);
 
-    // KuCoin trading fee (applies to the KuCoin leg)
-    const kucoinFeeUsd = tradeValueUsd * config.kucoin.tradingFeeRate;
+    // KuCoin trading fee — only applies if a leg is on KuCoin
+    const hasKucoinLeg = path.buyVenue === 'kucoin' || path.sellVenue === 'kucoin';
+    const kucoinFeeUsd = hasKucoinLeg ? tradeValueUsd * config.kucoin.tradingFeeRate : 0;
 
-    // Uniswap pool fee (already factored into the quote, but we track it for reporting)
-    const uniswapFeeTier = path.buyFeeTier || path.sellFeeTier || 3000;
-    const uniswapFeeRate = uniswapFeeTier / 1_000_000; // 3000 = 0.3%, 10000 = 1%
-    const uniswapPoolFeeUsd = tradeValueUsd * uniswapFeeRate;
+    // Uniswap pool fee (already factored into quoted prices, tracked for reporting)
+    const buyFeeTier = path.buyFeeTier || 0;
+    const sellFeeTier = path.sellFeeTier || 0;
+    const buyFeeRate = buyFeeTier / 1_000_000;
+    const sellFeeRate = sellFeeTier / 1_000_000;
+    const uniswapPoolFeeUsd = tradeValueUsd * (buyFeeRate + sellFeeRate);
 
-    // Gas cost estimate for Arbitrum
-    const gasEstimateUsd = this.estimateGasCostUsd();
+    // Gas cost: count on-chain swap transactions
+    let numOnChainSwaps = 0;
+    if (path.buyVenue === 'uniswap_v3') numOnChainSwaps++;
+    if (path.sellVenue === 'uniswap_v3') numOnChainSwaps++;
+    if (path.pathType === 'triangular') numOnChainSwaps++; // 3rd leg swap
 
-    // Slippage estimate (simple model: 0.1% for small trades, scales with size)
+    const gasEstimateUsd = this.estimateGasCostUsd(numOnChainSwaps);
+
+    // Slippage estimate
     const slippageEstimateUsd = this.estimateSlippage(tradeSizeIdos, tradeValueUsd);
 
-    const totalFeesUsd = kucoinFeeUsd + gasEstimateUsd + slippageEstimateUsd;
-    // Note: uniswapPoolFeeUsd is NOT added to total because it's already included in the quoted price
+    // 3rd leg fee (triangular only — WETH/USDC swap fee)
+    let thirdLegFeeUsd = 0;
+    if (path.pathType === 'triangular' && path.thirdLegFeeTier) {
+      const thirdFeeRate = path.thirdLegFeeTier / 1_000_000;
+      thirdLegFeeUsd = tradeValueUsd * thirdFeeRate;
+    }
+
+    // Total: KuCoin fee + gas + slippage + 3rd leg fee
+    // Note: Uniswap pool fees are already in the quoted prices, NOT added to total
+    const totalFeesUsd = kucoinFeeUsd + gasEstimateUsd + slippageEstimateUsd + thirdLegFeeUsd;
 
     return {
       kucoinFeeUsd,
@@ -49,23 +65,22 @@ export class FeeCalculator {
       gasEstimateUsd,
       slippageEstimateUsd,
       totalFeesUsd,
+      thirdLegFeeUsd: thirdLegFeeUsd > 0 ? thirdLegFeeUsd : undefined,
     };
   }
 
-  private estimateGasCostUsd(): number {
+  private estimateGasCostUsd(numSwaps: number = 1): number {
     if (this.currentGasPriceWei === 0n || this.ethPriceUsd === 0) {
-      // Fallback: assume $0.05 gas on Arbitrum
-      return 0.05;
+      return 0.05 * numSwaps; // Fallback: ~$0.05 per swap on Arbitrum
     }
 
-    const gasCostWei = ESTIMATED_SWAP_GAS * this.currentGasPriceWei;
+    const totalGas = ESTIMATED_SWAP_GAS * BigInt(numSwaps);
+    const gasCostWei = totalGas * this.currentGasPriceWei;
     const gasCostEth = parseFloat(ethers.formatEther(gasCostWei));
     return gasCostEth * this.ethPriceUsd;
   }
 
   private estimateSlippage(tradeSizeIdos: number, tradeValueUsd: number): number {
-    // Simple linear slippage model:
-    // Base slippage of 0.05% + 0.01% per $100 of trade value
     const baseSlippagePct = 0.05;
     const sizeSlippagePct = (tradeValueUsd / 100) * 0.01;
     const totalSlippagePct = Math.min(baseSlippagePct + sizeSlippagePct, config.trading.maxSlippagePct);
@@ -73,12 +88,9 @@ export class FeeCalculator {
   }
 
   getMinimumSpreadRequired(feeTier: FeeTier): number {
-    // Returns minimum spread % needed to break even
-    // KuCoin fee (both legs for CEX-DEX would be one KuCoin leg)
     const kucoinFee = config.kucoin.tradingFeeRate * 100; // 0.1%
-    const gasFeeApprox = 0.05; // approximate % for gas
-    const slippageApprox = 0.05; // approximate %
-    // Uniswap fee is already in the quoted price, no need to add here
+    const gasFeeApprox = 0.05;
+    const slippageApprox = 0.05;
     return kucoinFee + gasFeeApprox + slippageApprox;
   }
 }

@@ -3,6 +3,7 @@ export type Direction = 'buy' | 'sell';
 export type PoolToken = 'USDC' | 'WETH';
 export type FeeTier = 3000 | 10000;
 export type RecoveryStrategy = 'unwind' | 'retry' | 'hold';
+export type PathType = 'cex_dex' | 'cross_dex' | 'triangular';
 
 export interface PriceQuote {
   venue: Venue;
@@ -30,6 +31,7 @@ export interface NormalizedPrice {
 
 export interface ArbPath {
   id: string;
+  pathType: PathType;
   buyVenue: Venue;
   sellVenue: Venue;
   buyPair: string;
@@ -38,6 +40,11 @@ export interface ArbPath {
   sellFeeTier?: FeeTier;
   buyQuoteToken?: PoolToken;
   sellQuoteToken?: PoolToken;
+  // Triangular arb: 3rd leg swaps the sell-side quote token back to the buy-side quote token
+  // e.g. USDC→IDOS(pool1)→WETH(pool2)→USDC(weth/usdc pool) — thirdLeg swaps WETH→USDC
+  thirdLegTokenIn?: PoolToken;   // Token received from sell leg (e.g. WETH)
+  thirdLegTokenOut?: PoolToken;  // Token needed by buy leg (e.g. USDC)
+  thirdLegFeeTier?: FeeTier;     // Fee tier for the 3rd leg swap (WETH/USDC pool)
 }
 
 export interface ArbOpportunity {
@@ -50,6 +57,9 @@ export interface ArbOpportunity {
   netProfitUsd: number;
   netProfitPct: number;
   timestamp: number;
+  // Triangular-specific: amount of quote token in/out for the cycle
+  triangularAmountIn?: number;   // Starting amount (e.g. USDC spent)
+  triangularAmountOut?: number;  // Ending amount (e.g. USDC received after full cycle)
 }
 
 export interface FeeBreakdown {
@@ -58,6 +68,7 @@ export interface FeeBreakdown {
   gasEstimateUsd: number;
   slippageEstimateUsd: number;
   totalFeesUsd: number;
+  thirdLegFeeUsd?: number; // Extra fee for triangular 3rd leg
 }
 
 export interface TradeResult {
@@ -74,12 +85,25 @@ export interface TradeResult {
   timestamp: number;
 }
 
+export interface SwapResult {
+  success: boolean;
+  tokenIn: string;
+  tokenOut: string;
+  amountIn: number;
+  amountOut: number;
+  txHash?: string;
+  feeUsd: number;
+  error?: string;
+  timestamp: number;
+}
+
 export interface ExecutionResult {
   opportunity: ArbOpportunity;
   buyLeg: TradeResult;
   sellLeg: TradeResult;
+  thirdLeg?: SwapResult;   // Only for triangular arb
   netProfitUsd: number;
-  status: 'success' | 'partial_buy' | 'partial_sell' | 'both_failed';
+  status: 'success' | 'partial_buy' | 'partial_sell' | 'partial_third' | 'both_failed' | 'all_failed';
   recoveryAction?: string;
   timestamp: number;
 }

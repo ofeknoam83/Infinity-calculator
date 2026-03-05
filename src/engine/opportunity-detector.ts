@@ -18,7 +18,15 @@ export class OpportunityDetector extends EventEmitter {
     this.aggregator = aggregator;
     this.feeCalculator = feeCalculator;
     this.paths = generateArbPaths();
-    logger.info(`Initialized ${this.paths.length} arbitrage paths`);
+
+    const cexDex = this.paths.filter(p => p.pathType === 'cex_dex').length;
+    const crossDex = this.paths.filter(p => p.pathType === 'cross_dex').length;
+    const triangular = this.paths.filter(p => p.pathType === 'triangular').length;
+    logger.info(`Initialized ${this.paths.length} arbitrage paths`, {
+      cexDex,
+      crossDex,
+      triangular,
+    });
   }
 
   start(): void {
@@ -37,69 +45,26 @@ export class OpportunityDetector extends EventEmitter {
 
   private evaluate(): void {
     if (this.locked) return;
-
-    // Cooldown check
     if (Date.now() - this.lastTradeAt < config.trading.cooldownMs) return;
 
     const prices = this.aggregator.getAllPrices();
-    if (prices.length < 2) return; // Need at least KuCoin + one Uniswap pool
+    if (prices.length < 2) return;
 
-    // Update fee calculator with latest data
     this.feeCalculator.updateEthPrice(this.aggregator.getEthPriceUsd());
 
     let bestOpportunity: ArbOpportunity | null = null;
 
     for (const path of this.paths) {
-      const buyPrice = this.getPriceForLeg(path, 'buy', prices);
-      const sellPrice = this.getPriceForLeg(path, 'sell', prices);
+      let opportunity: ArbOpportunity | null = null;
 
-      if (!buyPrice || !sellPrice) continue;
+      if (path.pathType === 'triangular') {
+        opportunity = this.evaluateTriangular(path, prices);
+      } else {
+        // CEX-DEX and cross-DEX use the same 2-leg evaluation
+        opportunity = this.evaluateTwoLeg(path, prices);
+      }
 
-      // Raw spread
-      const spreadPct = ((sellPrice.sellPriceUsd - buyPrice.buyPriceUsd) / buyPrice.buyPriceUsd) * 100;
-
-      if (spreadPct <= 0) continue; // No positive spread
-
-      // Determine trade size (limited by available liquidity on both sides)
-      const tradeSizeIdos = Math.min(
-        buyPrice.maxBuySizeIdos,
-        sellPrice.maxSellSizeIdos,
-        config.trading.maxTradeSizeIdos,
-      );
-
-      if (tradeSizeIdos <= 0) continue;
-
-      // Calculate fees
-      const fees = this.feeCalculator.calculateFees(
-        path,
-        tradeSizeIdos,
-        buyPrice.buyPriceUsd,
-        sellPrice.sellPriceUsd,
-      );
-
-      // Net profit
-      const grossProfitUsd = (sellPrice.sellPriceUsd - buyPrice.buyPriceUsd) * tradeSizeIdos;
-      const netProfitUsd = grossProfitUsd - fees.totalFeesUsd;
-      const netProfitPct = (netProfitUsd / (buyPrice.buyPriceUsd * tradeSizeIdos)) * 100;
-
-      // Check thresholds
-      if (netProfitUsd < config.trading.minProfitUsd) continue;
-      if (netProfitPct < config.trading.minProfitPct) continue;
-
-      const opportunity: ArbOpportunity = {
-        path,
-        buyPriceUsd: buyPrice.buyPriceUsd,
-        sellPriceUsd: sellPrice.sellPriceUsd,
-        spreadPct,
-        tradeSizeIdos,
-        estimatedFees: fees,
-        netProfitUsd,
-        netProfitPct,
-        timestamp: Date.now(),
-      };
-
-      // Track best opportunity
-      if (!bestOpportunity || netProfitUsd > bestOpportunity.netProfitUsd) {
+      if (opportunity && (!bestOpportunity || opportunity.netProfitUsd > bestOpportunity.netProfitUsd)) {
         bestOpportunity = opportunity;
       }
     }
@@ -107,6 +72,7 @@ export class OpportunityDetector extends EventEmitter {
     if (bestOpportunity) {
       logger.info('Arbitrage opportunity detected!', {
         path: getPathDescription(bestOpportunity.path),
+        type: bestOpportunity.path.pathType,
         spread: `${bestOpportunity.spreadPct.toFixed(3)}%`,
         netProfit: `$${bestOpportunity.netProfitUsd.toFixed(4)}`,
         size: bestOpportunity.tradeSizeIdos,
@@ -114,6 +80,111 @@ export class OpportunityDetector extends EventEmitter {
       this.lastTradeAt = Date.now();
       this.emit('opportunity', bestOpportunity);
     }
+  }
+
+  private evaluateTwoLeg(path: ArbPath, prices: NormalizedPrice[]): ArbOpportunity | null {
+    const buyPrice = this.getPriceForLeg(path, 'buy', prices);
+    const sellPrice = this.getPriceForLeg(path, 'sell', prices);
+
+    if (!buyPrice || !sellPrice) return null;
+
+    const spreadPct = ((sellPrice.sellPriceUsd - buyPrice.buyPriceUsd) / buyPrice.buyPriceUsd) * 100;
+    if (spreadPct <= 0) return null;
+
+    const tradeSizeIdos = Math.min(
+      buyPrice.maxBuySizeIdos,
+      sellPrice.maxSellSizeIdos,
+      config.trading.maxTradeSizeIdos,
+    );
+    if (tradeSizeIdos <= 0) return null;
+
+    const fees = this.feeCalculator.calculateFees(
+      path,
+      tradeSizeIdos,
+      buyPrice.buyPriceUsd,
+      sellPrice.sellPriceUsd,
+    );
+
+    const grossProfitUsd = (sellPrice.sellPriceUsd - buyPrice.buyPriceUsd) * tradeSizeIdos;
+    const netProfitUsd = grossProfitUsd - fees.totalFeesUsd;
+    const netProfitPct = (netProfitUsd / (buyPrice.buyPriceUsd * tradeSizeIdos)) * 100;
+
+    if (netProfitUsd < config.trading.minProfitUsd) return null;
+    if (netProfitPct < config.trading.minProfitPct) return null;
+
+    return {
+      path,
+      buyPriceUsd: buyPrice.buyPriceUsd,
+      sellPriceUsd: sellPrice.sellPriceUsd,
+      spreadPct,
+      tradeSizeIdos,
+      estimatedFees: fees,
+      netProfitUsd,
+      netProfitPct,
+      timestamp: Date.now(),
+    };
+  }
+
+  /**
+   * Triangular arb evaluation:
+   *   Leg 1: Spend quoteA to buy IDOS on pool A
+   *   Leg 2: Sell IDOS for quoteB on pool B
+   *   Leg 3: Swap quoteB back to quoteA
+   *
+   * Profit = (amount of quoteA received after full cycle) - (amount of quoteA spent)
+   *
+   * We use the normalized USD prices to estimate the cycle profit.
+   * The key insight: if buy price on USDC pool is lower than sell price on WETH pool
+   * (after converting WETH→USDC), there's a triangular arb.
+   */
+  private evaluateTriangular(path: ArbPath, prices: NormalizedPrice[]): ArbOpportunity | null {
+    const buyPrice = this.getPriceForLeg(path, 'buy', prices);
+    const sellPrice = this.getPriceForLeg(path, 'sell', prices);
+
+    if (!buyPrice || !sellPrice) return null;
+
+    // The spread in USD terms already accounts for the WETH→USD conversion
+    // The 3rd leg (WETH↔USDC swap) adds extra fee that we account for in FeeCalculator
+    const spreadPct = ((sellPrice.sellPriceUsd - buyPrice.buyPriceUsd) / buyPrice.buyPriceUsd) * 100;
+    if (spreadPct <= 0) return null;
+
+    const tradeSizeIdos = Math.min(
+      buyPrice.maxBuySizeIdos,
+      sellPrice.maxSellSizeIdos,
+      config.trading.maxTradeSizeIdos,
+    );
+    if (tradeSizeIdos <= 0) return null;
+
+    const fees = this.feeCalculator.calculateFees(
+      path,
+      tradeSizeIdos,
+      buyPrice.buyPriceUsd,
+      sellPrice.sellPriceUsd,
+    );
+
+    const grossProfitUsd = (sellPrice.sellPriceUsd - buyPrice.buyPriceUsd) * tradeSizeIdos;
+    const netProfitUsd = grossProfitUsd - fees.totalFeesUsd;
+    const netProfitPct = (netProfitUsd / (buyPrice.buyPriceUsd * tradeSizeIdos)) * 100;
+
+    if (netProfitUsd < config.trading.minProfitUsd) return null;
+    if (netProfitPct < config.trading.minProfitPct) return null;
+
+    const triangularAmountIn = buyPrice.buyPriceUsd * tradeSizeIdos;
+    const triangularAmountOut = sellPrice.sellPriceUsd * tradeSizeIdos;
+
+    return {
+      path,
+      buyPriceUsd: buyPrice.buyPriceUsd,
+      sellPriceUsd: sellPrice.sellPriceUsd,
+      spreadPct,
+      tradeSizeIdos,
+      estimatedFees: fees,
+      netProfitUsd,
+      netProfitPct,
+      timestamp: Date.now(),
+      triangularAmountIn,
+      triangularAmountOut,
+    };
   }
 
   private getPriceForLeg(

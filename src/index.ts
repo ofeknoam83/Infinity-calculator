@@ -45,7 +45,7 @@ class ArbitrageBot {
     // Execution
     this.kucoinTrader = new KuCoinTrader();
     this.uniswapTrader = new UniswapTrader(this.uniswapFeed.getProvider());
-    this.executor = new Executor(this.kucoinTrader, this.uniswapTrader);
+    this.executor = new Executor(this.kucoinTrader, this.uniswapTrader, this.aggregator);
 
     // Inventory
     this.balanceTracker = new BalanceTracker(this.kucoinTrader, this.uniswapTrader);
@@ -59,6 +59,7 @@ class ArbitrageBot {
     logger.info('=== IDOS Arbitrage Bot Starting ===');
     logger.info('KuCoin pair: IDOS/USDT');
     logger.info('Uniswap V3 pools: IDOS/USDC, IDOS/WETH on Arbitrum');
+    logger.info('Strategies: CEX-DEX, Cross-DEX, Triangular');
     logger.info(`Min profit: $${config.trading.minProfitUsd} / ${config.trading.minProfitPct}%`);
     logger.info(`Max trade size: ${config.trading.maxTradeSizeIdos} IDOS`);
     logger.info(`Recovery strategy: ${config.recovery.strategy}`);

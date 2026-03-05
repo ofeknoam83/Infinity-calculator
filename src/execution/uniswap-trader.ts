@@ -1,7 +1,7 @@
 import { ethers } from 'ethers';
 import { config } from '../config';
 import { logger } from '../utils/logger';
-import { TradeResult, Direction, FeeTier, PoolToken } from '../types';
+import { TradeResult, SwapResult, Direction, FeeTier, PoolToken } from '../types';
 import { UNISWAP_V3_SWAP_ROUTER_ABI, ERC20_ABI } from '../utils/abis';
 
 export class UniswapTrader {
@@ -212,6 +212,102 @@ export class UniswapTrader {
       txHash: receipt.hash,
       timestamp: Date.now(),
     };
+  }
+
+  /**
+   * Direct token-to-token swap (for triangular arb 3rd leg: e.g. WETH→USDC or USDC→WETH)
+   */
+  async swapTokens(
+    tokenIn: PoolToken,
+    tokenOut: PoolToken,
+    amountIn: number,
+    feeTier: FeeTier,
+    ethPriceUsd: number,
+  ): Promise<SwapResult> {
+    const startTime = Date.now();
+    const tokenInAddress = tokenIn === 'USDC' ? config.tokens.USDC : config.tokens.WETH;
+    const tokenOutAddress = tokenOut === 'USDC' ? config.tokens.USDC : config.tokens.WETH;
+    const tokenInDecimals = tokenIn === 'USDC' ? 6 : 18;
+    const tokenOutDecimals = tokenOut === 'USDC' ? 6 : 18;
+
+    try {
+      const amountInWei = ethers.parseUnits(amountIn.toFixed(tokenInDecimals), tokenInDecimals);
+
+      await this.ensureApproval(tokenInAddress, amountInWei);
+
+      // Estimate output: for WETH→USDC, output ≈ amountIn * ethPrice
+      // For USDC→WETH, output ≈ amountIn / ethPrice
+      const expectedOutput = tokenIn === 'WETH'
+        ? amountIn * ethPriceUsd
+        : amountIn / ethPriceUsd;
+
+      const slippageFactor = 1 - (config.trading.maxSlippagePct / 100);
+      const minAmountOut = ethers.parseUnits(
+        (expectedOutput * slippageFactor).toFixed(tokenOutDecimals),
+        tokenOutDecimals,
+      );
+
+      const deadline = Math.floor(Date.now() / 1000) + 60;
+
+      logger.info(`Swap ${tokenIn}→${tokenOut}`, {
+        amountIn,
+        expectedOutput,
+        minAmountOut: ethers.formatUnits(minAmountOut, tokenOutDecimals),
+        feeTier,
+      });
+
+      const tx = await this.router.exactInputSingle({
+        tokenIn: tokenInAddress,
+        tokenOut: tokenOutAddress,
+        fee: feeTier,
+        recipient: this.wallet.address,
+        deadline,
+        amountIn: amountInWei,
+        amountOutMinimum: minAmountOut,
+        sqrtPriceLimitX96: 0,
+      });
+
+      const receipt = await tx.wait();
+      const gasUsed = receipt.gasUsed;
+      const gasPrice = receipt.gasPrice || 0n;
+      const gasCostEth = parseFloat(ethers.formatEther(gasUsed * gasPrice));
+
+      logger.info(`Swap ${tokenIn}→${tokenOut} confirmed`, {
+        txHash: receipt.hash,
+        gasUsed: gasUsed.toString(),
+        gasCostEth,
+        latencyMs: Date.now() - startTime,
+      });
+
+      return {
+        success: true,
+        tokenIn,
+        tokenOut,
+        amountIn,
+        amountOut: expectedOutput, // Approximate; exact value from logs would be better
+        txHash: receipt.hash,
+        feeUsd: gasCostEth * ethPriceUsd,
+        timestamp: Date.now(),
+      };
+    } catch (err) {
+      const errorMsg = err instanceof Error ? err.message : String(err);
+      logger.error(`Swap ${tokenIn}→${tokenOut} failed`, {
+        error: errorMsg,
+        amountIn,
+        latencyMs: Date.now() - startTime,
+      });
+
+      return {
+        success: false,
+        tokenIn,
+        tokenOut,
+        amountIn,
+        amountOut: 0,
+        feeUsd: 0,
+        error: errorMsg,
+        timestamp: Date.now(),
+      };
+    }
   }
 
   private async ensureApproval(tokenAddress: string, amount: bigint): Promise<void> {
