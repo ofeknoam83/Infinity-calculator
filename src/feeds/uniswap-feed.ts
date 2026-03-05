@@ -144,17 +144,19 @@ export class UniswapFeed extends EventEmitter {
   }
 
   private async getPoolQuote(pool: PoolInfo): Promise<PriceQuote | null> {
-    // Use a representative trade size to get realistic pricing
-    // Quote for buying IDOS (input is quote token, output is IDOS)
-    // and selling IDOS (input is IDOS, output is quote token)
-
-    const idosAmount = ethers.parseUnits('100', pool.idosDecimals); // 100 IDOS
+    // Quote at the max trade size to get realistic pricing with actual price impact
+    const tradeSize = config.trading.maxTradeSizeIdos;
+    const idosAmount = ethers.parseUnits(
+      tradeSize.toFixed(pool.idosDecimals),
+      pool.idosDecimals,
+    );
+    const quoteTokenAddress = pool.quoteToken === 'USDC' ? config.tokens.USDC : config.tokens.WETH;
 
     try {
       // Sell IDOS → get quote token (this gives us the "bid" - what we receive)
       const sellResult = await this.quoter.quoteExactInputSingle.staticCall({
         tokenIn: config.tokens.IDOS,
-        tokenOut: pool.quoteToken === 'USDC' ? config.tokens.USDC : config.tokens.WETH,
+        tokenOut: quoteTokenAddress,
         amountIn: idosAmount,
         fee: pool.fee,
         sqrtPriceLimitX96: 0,
@@ -163,11 +165,11 @@ export class UniswapFeed extends EventEmitter {
       const sellQuoteAmount = parseFloat(
         ethers.formatUnits(sellAmountOut, pool.quoteDecimals),
       );
-      const bidPrice = sellQuoteAmount / 100; // Price per IDOS
+      const bidPrice = sellQuoteAmount / tradeSize; // Price per IDOS including impact
 
       // Buy IDOS → spend quote token (this gives us the "ask" - what we pay)
       const buyResult = await this.quoter.quoteExactOutputSingle.staticCall({
-        tokenIn: pool.quoteToken === 'USDC' ? config.tokens.USDC : config.tokens.WETH,
+        tokenIn: quoteTokenAddress,
         tokenOut: config.tokens.IDOS,
         amount: idosAmount,
         fee: pool.fee,
@@ -177,20 +179,26 @@ export class UniswapFeed extends EventEmitter {
       const buyQuoteAmount = parseFloat(
         ethers.formatUnits(buyAmountIn, pool.quoteDecimals),
       );
-      const askPrice = buyQuoteAmount / 100; // Price per IDOS
+      const askPrice = buyQuoteAmount / tradeSize; // Price per IDOS including impact
 
-      // Read pool liquidity for size estimation
-      const poolContract = new ethers.Contract(pool.address, UNISWAP_V3_POOL_ABI, this.provider);
-      const liquidity = await poolContract.liquidity();
-      const liquidityFloat = parseFloat(ethers.formatUnits(liquidity, pool.idosDecimals));
+      // Estimate tradeable depth using the quoter:
+      // If the full-size quote succeeds, the pool can handle maxTradeSizeIdos.
+      // The gasEstimate returned by the quoter indicates ticks crossed — more ticks = less depth.
+      // Use the gasEstimate as a heuristic: if it's very high, reduce available size.
+      const sellGas = Number(sellResult.gasEstimate);
+      const buyGas = Number(buyResult.gasEstimate);
+      // Each initialized tick crossing costs ~100k gas; base swap is ~130k
+      // If gas > 500k, the trade is crossing many ticks (thin liquidity)
+      const depthFactor = Math.min(1, 300_000 / Math.max(sellGas, buyGas, 1));
+      const estimatedDepthIdos = tradeSize * depthFactor;
 
       const priceQuote: PriceQuote = {
         venue: 'uniswap_v3',
         pair: `IDOS/${pool.quoteToken}`,
         bidPrice,
         askPrice,
-        bidSizeIdos: Math.min(liquidityFloat, config.trading.maxTradeSizeIdos),
-        askSizeIdos: Math.min(liquidityFloat, config.trading.maxTradeSizeIdos),
+        bidSizeIdos: Math.min(estimatedDepthIdos, config.trading.maxTradeSizeIdos),
+        askSizeIdos: Math.min(estimatedDepthIdos, config.trading.maxTradeSizeIdos),
         timestamp: Date.now(),
         feeTier: pool.fee,
         quoteToken: pool.quoteToken,
@@ -199,13 +207,71 @@ export class UniswapFeed extends EventEmitter {
       logger.debug(`Uniswap IDOS/${pool.quoteToken} fee=${pool.fee / 10000}%`, {
         bid: bidPrice.toFixed(6),
         ask: askPrice.toFixed(6),
+        depthIdos: estimatedDepthIdos.toFixed(0),
       });
 
       return priceQuote;
     } catch (err) {
-      logger.error(`QuoterV2 error for IDOS/${pool.quoteToken}`, { error: String(err) });
-      return null;
+      // If the full-size quote reverts, try a smaller size to still get pricing
+      try {
+        return await this.getPoolQuoteFallback(pool);
+      } catch {
+        logger.error(`QuoterV2 error for IDOS/${pool.quoteToken}`, { error: String(err) });
+        return null;
+      }
     }
+  }
+
+  /**
+   * Fallback: quote at 1/10th trade size when full-size quote reverts (insufficient liquidity).
+   */
+  private async getPoolQuoteFallback(pool: PoolInfo): Promise<PriceQuote | null> {
+    const fallbackSize = config.trading.maxTradeSizeIdos / 10;
+    const idosAmount = ethers.parseUnits(
+      fallbackSize.toFixed(pool.idosDecimals),
+      pool.idosDecimals,
+    );
+    const quoteTokenAddress = pool.quoteToken === 'USDC' ? config.tokens.USDC : config.tokens.WETH;
+
+    const sellResult = await this.quoter.quoteExactInputSingle.staticCall({
+      tokenIn: config.tokens.IDOS,
+      tokenOut: quoteTokenAddress,
+      amountIn: idosAmount,
+      fee: pool.fee,
+      sqrtPriceLimitX96: 0,
+    });
+    const bidPrice = parseFloat(
+      ethers.formatUnits(sellResult.amountOut, pool.quoteDecimals),
+    ) / fallbackSize;
+
+    const buyResult = await this.quoter.quoteExactOutputSingle.staticCall({
+      tokenIn: quoteTokenAddress,
+      tokenOut: config.tokens.IDOS,
+      amount: idosAmount,
+      fee: pool.fee,
+      sqrtPriceLimitX96: 0,
+    });
+    const askPrice = parseFloat(
+      ethers.formatUnits(buyResult.amountIn, pool.quoteDecimals),
+    ) / fallbackSize;
+
+    logger.debug(`Uniswap IDOS/${pool.quoteToken} fee=${pool.fee / 10000}% (fallback size)`, {
+      bid: bidPrice.toFixed(6),
+      ask: askPrice.toFixed(6),
+      depthIdos: fallbackSize,
+    });
+
+    return {
+      venue: 'uniswap_v3',
+      pair: `IDOS/${pool.quoteToken}`,
+      bidPrice,
+      askPrice,
+      bidSizeIdos: fallbackSize,
+      askSizeIdos: fallbackSize,
+      timestamp: Date.now(),
+      feeTier: pool.fee,
+      quoteToken: pool.quoteToken,
+    };
   }
 
   private async updateGasPrice(): Promise<void> {

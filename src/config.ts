@@ -28,9 +28,9 @@ export const config = {
     chainId: 42161,
   },
 
-  // Token addresses on Arbitrum
+  // Token addresses on Arbitrum (all checksummed)
   tokens: {
-    IDOS: '0x68731d6f14b827bbcffbebb62b19daa18de1d79c',
+    IDOS: '0x68731D6f14b827BbcFfEBb62B19DaA18De1d79C',
     USDC: '0xaf88d065e77c8cC2239327C5EDb3A432268e5831',
     WETH: '0x82aF49447D8a07e3bd95BD0d56f35241523fBab1',
   },
@@ -40,7 +40,7 @@ export const config = {
     factory: '0x1F98431c8aD98523631AE4a59f267346ea31F984',
     swapRouter: '0xE592427A0AEce92De3Edee1F18E0157C05861564',
     quoterV2: '0x61fFE014bA17989E743c5F6cB21bF9697530B21e',
-    feeTiers: [3000, 10000] as const, // 0.3% and 1%
+    feeTiers: [500, 3000, 10000] as const, // 0.05%, 0.3%, and 1%
   },
 
   // Trading parameters
@@ -53,11 +53,14 @@ export const config = {
     executionTimeoutMs: 5000,
   },
 
-  // MEV protection
+  // MEV protection — on Arbitrum, use a private RPC to avoid sequencer frontrunning
   mev: {
     usePrivateRpc: optionalEnv('USE_PRIVATE_RPC', 'false') === 'true',
-    flashbotsRpcUrl: process.env['FLASHBOTS_RPC_URL'] || '',
+    privateRpcUrl: process.env['PRIVATE_RPC_URL'] || '',
   },
+
+  // Stablecoin depeg threshold — reject prices if USDT/USDC diverge more than this %
+  depegThresholdPct: parseFloat(optionalEnv('DEPEG_THRESHOLD_PCT', '0.5')),
 
   // Dashboard
   dashboard: {

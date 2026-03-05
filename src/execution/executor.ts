@@ -37,10 +37,26 @@ export class Executor extends EventEmitter {
       return this.createFailedResult(opportunity, 'Concurrent execution blocked');
     }
 
+    // Block cross-venue trades during stablecoin depeg
+    if (this.aggregator.isDepegDetected() && opportunity.path.pathType === 'cex_dex') {
+      logger.warn('DEPEG active — skipping CEX-DEX opportunity');
+      return this.createFailedResult(opportunity, 'USDT/USDC depeg detected');
+    }
+
     this.executing = true;
     const tradeId = generateTradeId();
 
     try {
+      // Keep ETH price in sync on the trader for gas fee calculation
+      this.uniswapTrader.updateEthPrice(this.aggregator.getEthPriceUsd());
+
+      // Pre-execution balance check
+      const balanceError = await this.checkBalances(opportunity);
+      if (balanceError) {
+        logger.error(`Trade ${tradeId} INSUFFICIENT BALANCE`, { error: balanceError });
+        return this.createFailedResult(opportunity, balanceError);
+      }
+
       logger.info(`Executing ${opportunity.path.pathType} trade ${tradeId}`, {
         path: opportunity.path.id,
         size: opportunity.tradeSizeIdos,
@@ -67,7 +83,51 @@ export class Executor extends EventEmitter {
   }
 
   /**
-   * CEX-DEX: Execute buy and sell legs simultaneously on KuCoin + Uniswap
+   * Pre-flight balance check to avoid wasting gas on trades that will revert.
+   */
+  private async checkBalances(opportunity: ArbOpportunity): Promise<string | null> {
+    try {
+      const path = opportunity.path;
+      const sizeIdos = opportunity.tradeSizeIdos;
+
+      // Check Uniswap-side balances
+      if (path.buyVenue === 'uniswap_v3' || path.sellVenue === 'uniswap_v3' || path.pathType === 'triangular') {
+        const balances = await this.uniswapTrader.getBalances();
+
+        // If buying IDOS on Uniswap, we need the quote token
+        if (path.buyVenue === 'uniswap_v3') {
+          const needed = sizeIdos * opportunity.buyPriceUsd * 1.02; // 2% buffer
+          if (path.buyQuoteToken === 'USDC' && balances.usdc < needed) {
+            return `Insufficient USDC: have ${balances.usdc.toFixed(2)}, need ~${needed.toFixed(2)}`;
+          }
+          if (path.buyQuoteToken === 'WETH') {
+            const ethPrice = this.aggregator.getEthPriceUsd();
+            const neededWeth = ethPrice > 0 ? needed / ethPrice : 0;
+            if (balances.weth < neededWeth) {
+              return `Insufficient WETH: have ${balances.weth.toFixed(6)}, need ~${neededWeth.toFixed(6)}`;
+            }
+          }
+        }
+
+        // If selling IDOS on Uniswap, we need IDOS
+        if (path.sellVenue === 'uniswap_v3' && balances.idos < sizeIdos) {
+          return `Insufficient IDOS on Arbitrum: have ${balances.idos.toFixed(2)}, need ${sizeIdos}`;
+        }
+
+        // Gas check (need ETH for gas)
+        if (balances.eth < 0.001) {
+          return `Insufficient ETH for gas: have ${balances.eth.toFixed(6)} ETH`;
+        }
+      }
+    } catch (err) {
+      logger.warn('Balance check failed, proceeding anyway', { error: String(err) });
+    }
+    return null;
+  }
+
+  /**
+   * CEX-DEX: Execute buy and sell legs simultaneously on KuCoin + Uniswap.
+   * Different venues, so parallel execution is safe (no nonce collision).
    */
   private async executeCexDex(
     opportunity: ArbOpportunity,
@@ -89,36 +149,40 @@ export class Executor extends EventEmitter {
   }
 
   /**
-   * Cross-DEX: Execute buy and sell legs simultaneously on two different Uniswap pools
-   * Both legs are on-chain, fired in parallel.
+   * Cross-DEX: Both legs are on Uniswap — execute sequentially to avoid nonce collision.
+   * NonceManager handles sequencing, but sequential execution is safer for error handling.
+   * Buy first, then sell (if buy fails, we haven't committed to selling).
    */
   private async executeCrossDex(
     opportunity: ArbOpportunity,
     tradeId: string,
   ): Promise<ExecutionResult> {
-    // Same execution pattern as CEX-DEX — both legs fire simultaneously
-    const buyLegPromise = this.executeLeg(opportunity, 'buy');
-    const sellLegPromise = this.executeLeg(opportunity, 'sell');
+    const buyResult = await this.executeLeg(opportunity, 'buy');
 
-    const timeout = new Promise<[TradeResult, TradeResult]>((_, reject) =>
-      setTimeout(() => reject(new Error('Execution timeout')), config.trading.executionTimeoutMs),
-    );
+    if (!buyResult.success) {
+      // Buy failed, don't proceed to sell
+      const failedSell: TradeResult = {
+        success: false,
+        venue: 'uniswap_v3',
+        direction: 'sell',
+        amountIdos: 0,
+        priceUsd: 0,
+        totalUsd: 0,
+        feeUsd: 0,
+        error: 'Skipped: buy leg failed',
+        timestamp: Date.now(),
+      };
+      return this.resolveResult(opportunity, buyResult, failedSell, tradeId);
+    }
 
-    const [buyResult, sellResult] = await Promise.race([
-      Promise.all([buyLegPromise, sellLegPromise]),
-      timeout,
-    ]);
-
+    const sellResult = await this.executeLeg(opportunity, 'sell');
     return this.resolveResult(opportunity, buyResult, sellResult, tradeId);
   }
 
   /**
-   * Triangular: 3-leg sequential execution on Uniswap
-   *   Leg 1: Buy IDOS with tokenA on pool A
-   *   Leg 2: Sell IDOS for tokenB on pool B
-   *   Leg 3: Swap tokenB back to tokenA
-   *
-   * Legs 1+2 can be parallel (independent swaps), leg 3 depends on leg 2 output.
+   * Triangular: 3-leg execution, all on Uniswap.
+   * Sequential: buy → sell → swap back.
+   * Uses actual output amounts from Swap event decoding for each subsequent leg.
    */
   private async executeTriangular(
     opportunity: ArbOpportunity,
@@ -126,39 +190,51 @@ export class Executor extends EventEmitter {
   ): Promise<ExecutionResult> {
     const path = opportunity.path;
 
-    // Leg 1 + Leg 2: Buy IDOS and Sell IDOS in parallel
-    const buyLegPromise = this.executeLeg(opportunity, 'buy');
-    const sellLegPromise = this.executeLeg(opportunity, 'sell');
-
-    const timeout12 = new Promise<[TradeResult, TradeResult]>((_, reject) =>
-      setTimeout(() => reject(new Error('Triangular legs 1+2 timeout')), config.trading.executionTimeoutMs),
-    );
-
-    const [buyResult, sellResult] = await Promise.race([
-      Promise.all([buyLegPromise, sellLegPromise]),
-      timeout12,
-    ]);
-
-    // If either leg failed, handle recovery for the 2 legs (same as cross-DEX)
-    if (!buyResult.success || !sellResult.success) {
-      const result = await this.resolveResult(opportunity, buyResult, sellResult, tradeId);
-      return result;
+    // Leg 1: Buy IDOS with tokenA
+    const buyResult = await this.executeLeg(opportunity, 'buy');
+    if (!buyResult.success) {
+      const failedSell: TradeResult = {
+        success: false, venue: 'uniswap_v3', direction: 'sell',
+        amountIdos: 0, priceUsd: 0, totalUsd: 0, feeUsd: 0,
+        error: 'Skipped: buy leg failed', timestamp: Date.now(),
+      };
+      return this.resolveResult(opportunity, buyResult, failedSell, tradeId);
     }
 
-    // Both legs succeeded — now execute leg 3: swap sellQuoteToken → buyQuoteToken
+    // Leg 2: Sell IDOS for tokenB
+    const sellResult = await this.executeLeg(opportunity, 'sell');
+    if (!sellResult.success) {
+      return this.resolveResult(opportunity, buyResult, sellResult, tradeId);
+    }
+
+    // Both legs succeeded — execute leg 3: swap tokenB → tokenA
     logger.info(`Trade ${tradeId} legs 1+2 succeeded, executing leg 3`, {
       thirdLeg: `${path.thirdLegTokenIn}→${path.thirdLegTokenOut}`,
     });
 
-    // Estimate how much of the sell-side token we received
-    // sellResult.totalUsd gives us the USD value; we need the native amount
-    // For WETH: amount = totalUsd / ethPrice; For USDC: amount ≈ totalUsd
+    // Use actual sell output for 3rd leg input.
+    // sellResult now contains real totalUsd from Swap event decoding.
+    // Convert USD value to native token amount for the 3rd leg.
     const ethPrice = this.aggregator.getEthPriceUsd();
     let thirdLegAmountIn: number;
-    if (path.thirdLegTokenIn === 'WETH') {
+    if (path.sellQuoteToken === 'WETH') {
+      // Sell leg received WETH — convert sell's USD totalUsd to WETH
       thirdLegAmountIn = ethPrice > 0 ? sellResult.totalUsd / ethPrice : 0;
     } else {
-      thirdLegAmountIn = sellResult.totalUsd; // USDC ≈ USD
+      // Sell leg received USDC — totalUsd ≈ USDC amount
+      thirdLegAmountIn = sellResult.totalUsd;
+    }
+
+    if (thirdLegAmountIn <= 0) {
+      logger.error(`Trade ${tradeId} cannot compute 3rd leg amount`);
+      const failedThird: SwapResult = {
+        success: false, tokenIn: path.thirdLegTokenIn || '', tokenOut: path.thirdLegTokenOut || '',
+        amountIn: 0, amountOut: 0, feeUsd: 0, error: 'Zero input amount', timestamp: Date.now(),
+      };
+      return {
+        opportunity, buyLeg: buyResult, sellLeg: sellResult, thirdLeg: failedThird,
+        netProfitUsd: 0, status: 'partial_third', timestamp: Date.now(),
+      };
     }
 
     const thirdLegResult = await this.uniswapTrader.swapTokens(
@@ -170,10 +246,7 @@ export class Executor extends EventEmitter {
     );
 
     if (thirdLegResult.success) {
-      const netProfitUsd = thirdLegResult.amountOut - (opportunity.buyPriceUsd * opportunity.tradeSizeIdos)
-        - buyResult.feeUsd - sellResult.feeUsd - thirdLegResult.feeUsd;
-
-      // For WETH-denominated final amount, convert to USD
+      // Compute actual profit: final amount of tokenA - initial amount of tokenA spent
       const finalUsd = path.thirdLegTokenOut === 'WETH'
         ? thirdLegResult.amountOut * ethPrice
         : thirdLegResult.amountOut;
@@ -198,12 +271,16 @@ export class Executor extends EventEmitter {
       this.emit('execution', result);
       return result;
     } else {
-      // Leg 3 failed — we have tokenB but couldn't convert back to tokenA
       logger.error(`Trade ${tradeId} TRIANGULAR leg 3 FAILED`, {
         error: thirdLegResult.error,
         holdingToken: path.thirdLegTokenIn,
         holdingAmount: thirdLegAmountIn,
       });
+
+      // Attempt recovery for 3rd leg failure
+      const recoveryAction = await this.recovery.handleThirdLegFailure(
+        opportunity, thirdLegResult, thirdLegAmountIn,
+      );
 
       const result: ExecutionResult = {
         opportunity,
@@ -212,7 +289,7 @@ export class Executor extends EventEmitter {
         thirdLeg: thirdLegResult,
         netProfitUsd: 0,
         status: 'partial_third',
-        recoveryAction: `holding_${path.thirdLegTokenIn}_${thirdLegAmountIn.toFixed(6)}`,
+        recoveryAction,
         timestamp: Date.now(),
       };
       this.emit('execution', result);

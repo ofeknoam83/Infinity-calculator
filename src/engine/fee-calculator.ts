@@ -1,6 +1,5 @@
 import { ethers } from 'ethers';
 import { config } from '../config';
-import { logger } from '../utils/logger';
 import { FeeBreakdown, ArbPath, FeeTier } from '../types';
 
 // Estimated gas for a Uniswap V3 exactInputSingle swap on Arbitrum
@@ -45,8 +44,8 @@ export class FeeCalculator {
 
     const gasEstimateUsd = this.estimateGasCostUsd(numOnChainSwaps);
 
-    // Slippage estimate
-    const slippageEstimateUsd = this.estimateSlippage(tradeSizeIdos, tradeValueUsd);
+    // Slippage estimate — compounds per on-chain swap leg
+    const slippageEstimateUsd = this.estimateSlippage(tradeSizeIdos, tradeValueUsd, numOnChainSwaps);
 
     // 3rd leg fee (triangular only — WETH/USDC swap fee)
     let thirdLegFeeUsd = 0;
@@ -80,10 +79,20 @@ export class FeeCalculator {
     return gasCostEth * this.ethPriceUsd;
   }
 
-  private estimateSlippage(tradeSizeIdos: number, tradeValueUsd: number): number {
+  /**
+   * Slippage compounds per on-chain swap: each swap moves the pool's price,
+   * and for cross-DEX / triangular, multiple swaps compound the impact.
+   */
+  private estimateSlippage(
+    tradeSizeIdos: number,
+    tradeValueUsd: number,
+    numOnChainSwaps: number,
+  ): number {
     const baseSlippagePct = 0.05;
     const sizeSlippagePct = (tradeValueUsd / 100) * 0.01;
-    const totalSlippagePct = Math.min(baseSlippagePct + sizeSlippagePct, config.trading.maxSlippagePct);
+    const perSwapSlippagePct = Math.min(baseSlippagePct + sizeSlippagePct, config.trading.maxSlippagePct);
+    // Compound: total slippage = 1 - (1 - s)^n ≈ n*s for small s
+    const totalSlippagePct = (1 - Math.pow(1 - perSwapSlippagePct / 100, numOnChainSwaps)) * 100;
     return tradeValueUsd * (totalSlippagePct / 100);
   }
 

@@ -76,10 +76,12 @@ class ArbitrageBot {
       // Start engine
       this.detector.start();
 
-      // Wire up gas price updates to fee calculator
+      // Wire up gas price and ETH price updates
       this.feeCalculator.updateGasPrice(this.uniswapFeed.getGasPrice());
+      this.uniswapTrader.updateEthPrice(this.aggregator.getEthPriceUsd());
       setInterval(() => {
         this.feeCalculator.updateGasPrice(this.uniswapFeed.getGasPrice());
+        this.uniswapTrader.updateEthPrice(this.aggregator.getEthPriceUsd());
       }, config.intervals.gasPricePollMs);
 
       // Start balance tracking

@@ -1,7 +1,7 @@
 export type Venue = 'kucoin' | 'uniswap_v3';
 export type Direction = 'buy' | 'sell';
 export type PoolToken = 'USDC' | 'WETH';
-export type FeeTier = 3000 | 10000;
+export type FeeTier = 500 | 3000 | 10000;
 export type RecoveryStrategy = 'unwind' | 'retry' | 'hold';
 export type PathType = 'cex_dex' | 'cross_dex' | 'triangular';
 

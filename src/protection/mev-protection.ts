@@ -9,9 +9,9 @@ export class MevProtection {
   constructor(provider: ethers.JsonRpcProvider) {
     this.provider = provider;
 
-    if (config.mev.usePrivateRpc && config.mev.flashbotsRpcUrl) {
-      this.privateProvider = new ethers.JsonRpcProvider(config.mev.flashbotsRpcUrl);
-      logger.info('MEV protection: using private RPC', { url: config.mev.flashbotsRpcUrl });
+    if (config.mev.usePrivateRpc && config.mev.privateRpcUrl) {
+      this.privateProvider = new ethers.JsonRpcProvider(config.mev.privateRpcUrl);
+      logger.info('MEV protection: using private RPC', { url: config.mev.privateRpcUrl });
     } else {
       logger.info('MEV protection: using standard Arbitrum sequencer (inherent MEV resistance)');
     }

@@ -54,7 +54,12 @@ export class OpportunityDetector extends EventEmitter {
 
     let bestOpportunity: ArbOpportunity | null = null;
 
+    const depeg = this.aggregator.isDepegDetected();
+
     for (const path of this.paths) {
+      // Skip CEX-DEX paths during stablecoin depeg (USDT vs USDC divergence)
+      if (depeg && path.pathType === 'cex_dex') continue;
+
       let opportunity: ArbOpportunity | null = null;
 
       if (path.pathType === 'triangular') {

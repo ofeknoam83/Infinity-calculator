@@ -7,6 +7,8 @@ import { NormalizedPrice, PriceQuote } from '../types';
 import { isStale } from '../utils/helpers';
 
 const PRICE_MAX_AGE_MS = 30_000; // 30 seconds
+// Poll ETH price at least as fast as Uniswap prices to avoid stale WETH→USD conversion
+const ETH_PRICE_POLL_MS = Math.min(config.intervals.uniswapPollMs, 3_000);
 
 export class PriceAggregator extends EventEmitter {
   private kucoinFeed: KuCoinFeed;
@@ -14,6 +16,7 @@ export class PriceAggregator extends EventEmitter {
   private normalizedPrices = new Map<string, NormalizedPrice>();
   private ethPriceUsd: number = 0;
   private ethPriceTimer: NodeJS.Timeout | null = null;
+  private depegDetected = false;
 
   constructor(kucoinFeed: KuCoinFeed, uniswapFeed: UniswapFeed) {
     super();
@@ -22,7 +25,7 @@ export class PriceAggregator extends EventEmitter {
   }
 
   async start(): Promise<void> {
-    logger.info('Starting price aggregator');
+    logger.info('Starting price aggregator', { ethPricePollMs: ETH_PRICE_POLL_MS });
 
     // Listen for price updates
     this.kucoinFeed.on('price', (quote: PriceQuote) => {
@@ -35,7 +38,7 @@ export class PriceAggregator extends EventEmitter {
 
     // Fetch ETH price for converting WETH-denominated prices
     await this.updateEthPrice();
-    this.ethPriceTimer = setInterval(() => this.updateEthPrice(), 15_000);
+    this.ethPriceTimer = setInterval(() => this.updateEthPrice(), ETH_PRICE_POLL_MS);
   }
 
   private async updateEthPrice(): Promise<void> {
@@ -55,6 +58,47 @@ export class PriceAggregator extends EventEmitter {
     } catch (err) {
       logger.error('Error fetching ETH price', { error: String(err) });
     }
+  }
+
+  /**
+   * Check for USDT/USDC depeg by comparing KuCoin (USDT) and Uniswap USDC prices.
+   * If the same asset is priced significantly differently in USDT vs USDC, one is depegged.
+   */
+  private checkDepeg(): void {
+    const kucoinPrice = this.normalizedPrices.get('kucoin_USDT');
+    const usdcPrices = Array.from(this.normalizedPrices.entries())
+      .filter(([k]) => k.startsWith('uniswap_USDC_'))
+      .map(([, v]) => v);
+
+    if (!kucoinPrice || usdcPrices.length === 0) {
+      this.depegDetected = false;
+      return;
+    }
+
+    // Compare mid prices — if they diverge beyond threshold, flag depeg
+    for (const usdcPrice of usdcPrices) {
+      const kucoinMid = (kucoinPrice.buyPriceUsd + kucoinPrice.sellPriceUsd) / 2;
+      const usdcMid = (usdcPrice.buyPriceUsd + usdcPrice.sellPriceUsd) / 2;
+      if (kucoinMid <= 0 || usdcMid <= 0) continue;
+
+      const divergencePct = Math.abs(kucoinMid - usdcMid) / kucoinMid * 100;
+      if (divergencePct > config.depegThresholdPct) {
+        if (!this.depegDetected) {
+          logger.warn('USDT/USDC DEPEG DETECTED — pausing cross-venue signals', {
+            kucoinMid,
+            usdcMid,
+            divergencePct: divergencePct.toFixed(3),
+          });
+        }
+        this.depegDetected = true;
+        return;
+      }
+    }
+
+    if (this.depegDetected) {
+      logger.info('USDT/USDC depeg resolved — resuming normal operation');
+    }
+    this.depegDetected = false;
   }
 
   private normalizeAndStore(quote: PriceQuote): void {
@@ -95,6 +139,10 @@ export class PriceAggregator extends EventEmitter {
     };
 
     this.normalizedPrices.set(key, normalized);
+
+    // Check depeg whenever we get a new price
+    this.checkDepeg();
+
     this.emit('normalized', normalized);
   }
 
@@ -117,6 +165,10 @@ export class PriceAggregator extends EventEmitter {
 
   getEthPriceUsd(): number {
     return this.ethPriceUsd;
+  }
+
+  isDepegDetected(): boolean {
+    return this.depegDetected;
   }
 
   async stop(): Promise<void> {

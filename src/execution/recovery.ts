@@ -1,6 +1,6 @@
 import { config } from '../config';
 import { logger } from '../utils/logger';
-import { TradeResult, ArbOpportunity, ExecutionResult } from '../types';
+import { TradeResult, SwapResult, ArbOpportunity, ExecutionResult } from '../types';
 import { KuCoinTrader } from './kucoin-trader';
 import { UniswapTrader } from './uniswap-trader';
 
@@ -106,6 +106,57 @@ export class RecoveryManager {
           boughtAt: buyResult.priceUsd,
         });
         return 'hold';
+    }
+  }
+
+  /**
+   * Handle triangular arb 3rd leg failure.
+   * Legs 1+2 succeeded, but the final swap (tokenB→tokenA) failed.
+   * We're holding tokenB (the sell-side quote token).
+   * Strategy: retry the swap, or hold for manual intervention.
+   */
+  async handleThirdLegFailure(
+    opportunity: ArbOpportunity,
+    thirdLegResult: SwapResult,
+    amountHeld: number,
+  ): Promise<string> {
+    const path = opportunity.path;
+    const tokenHeld = path.thirdLegTokenIn;
+    const tokenTarget = path.thirdLegTokenOut;
+    const strategy = config.recovery.strategy;
+
+    logger.warn('Triangular 3rd leg failed — recovery', {
+      tokenHeld,
+      amountHeld,
+      tokenTarget,
+      error: thirdLegResult.error,
+      strategy,
+    });
+
+    switch (strategy) {
+      case 'unwind':
+      case 'retry': {
+        // Retry the WETH→USDC (or USDC→WETH) swap once
+        logger.info(`Recovery: retrying ${tokenHeld}→${tokenTarget} swap`);
+        const retry = await this.uniswapTrader.swapTokens(
+          path.thirdLegTokenIn!,
+          path.thirdLegTokenOut!,
+          amountHeld,
+          path.thirdLegFeeTier!,
+          0, // ETH price not needed for retry slippage — the trader has its own
+        );
+        return retry.success
+          ? `retry_third_leg_ok`
+          : `retry_third_leg_failed_holding_${tokenHeld}_${amountHeld.toFixed(6)}`;
+      }
+
+      case 'hold':
+      default:
+        logger.warn('Recovery: HOLDING intermediate token — manual intervention needed', {
+          tokenHeld,
+          amountHeld,
+        });
+        return `hold_${tokenHeld}_${amountHeld.toFixed(6)}`;
     }
   }
 

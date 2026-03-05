@@ -2,22 +2,49 @@ import { ethers } from 'ethers';
 import { config } from '../config';
 import { logger } from '../utils/logger';
 import { TradeResult, SwapResult, Direction, FeeTier, PoolToken } from '../types';
-import { UNISWAP_V3_SWAP_ROUTER_ABI, ERC20_ABI } from '../utils/abis';
+import { UNISWAP_V3_SWAP_ROUTER_ABI, UNISWAP_V3_POOL_ABI, ERC20_ABI } from '../utils/abis';
+
+// Interface for Swap event decoding
+const poolIface = new ethers.Interface(UNISWAP_V3_POOL_ABI);
 
 export class UniswapTrader {
   private provider: ethers.JsonRpcProvider;
   private wallet: ethers.Wallet;
+  private signer: ethers.Signer;
   private router: ethers.Contract;
   private approvedTokens = new Set<string>();
+  private nonceMutex = Promise.resolve(); // Sequential nonce guard
+  private ethPriceUsd: number = 0;
 
   constructor(provider: ethers.JsonRpcProvider) {
     this.provider = provider;
-    this.wallet = new ethers.Wallet(config.arbitrum.privateKey, provider);
+
+    // Use private/MEV-protected RPC for sending transactions if configured
+    let txProvider: ethers.JsonRpcProvider;
+    if (config.mev.usePrivateRpc && config.mev.privateRpcUrl) {
+      logger.info('Using private RPC for transaction submission (MEV protection)');
+      txProvider = new ethers.JsonRpcProvider(config.mev.privateRpcUrl);
+    } else {
+      txProvider = provider;
+    }
+
+    this.wallet = new ethers.Wallet(config.arbitrum.privateKey, txProvider);
+    // Wrap wallet with NonceManager to handle concurrent sends
+    this.signer = new ethers.NonceManager(this.wallet);
     this.router = new ethers.Contract(
       config.uniswap.swapRouter,
       UNISWAP_V3_SWAP_ROUTER_ABI,
-      this.wallet,
+      this.signer,
     );
+  }
+
+  updateEthPrice(ethPriceUsd: number): void {
+    this.ethPriceUsd = ethPriceUsd;
+  }
+
+  private getGasFeeUsd(gasCostEth: number): number {
+    // Use tracked ETH price, not IDOS price
+    return gasCostEth * this.ethPriceUsd;
   }
 
   async executeTrade(
@@ -30,11 +57,10 @@ export class UniswapTrader {
     const startTime = Date.now();
     const quoteTokenAddress = quoteToken === 'USDC' ? config.tokens.USDC : config.tokens.WETH;
     const quoteDecimals = quoteToken === 'USDC' ? 6 : 18;
-    const idosDecimals = 18; // Assume 18, updated in start
+    const idosDecimals = 18;
 
     try {
       if (direction === 'sell') {
-        // Selling IDOS → receiving quote token
         return await this.sellIdos(
           amountIdos,
           expectedPriceUsd,
@@ -45,7 +71,6 @@ export class UniswapTrader {
           startTime,
         );
       } else {
-        // Buying IDOS → spending quote token
         return await this.buyIdos(
           amountIdos,
           expectedPriceUsd,
@@ -91,10 +116,8 @@ export class UniswapTrader {
   ): Promise<TradeResult> {
     const amountIn = ethers.parseUnits(amountIdos.toFixed(idosDecimals), idosDecimals);
 
-    // Ensure approval
     await this.ensureApproval(config.tokens.IDOS, amountIn);
 
-    // Calculate minimum output with slippage protection
     const expectedOutput = amountIdos * expectedPriceUsd;
     const slippageFactor = 1 - (config.trading.maxSlippagePct / 100);
     const minAmountOut = ethers.parseUnits(
@@ -102,7 +125,7 @@ export class UniswapTrader {
       quoteDecimals,
     );
 
-    const deadline = Math.floor(Date.now() / 1000) + 60; // 60 second deadline
+    const deadline = Math.floor(Date.now() / 1000) + 60;
 
     logger.info('Uniswap sell IDOS', {
       amountIn: amountIdos,
@@ -123,25 +146,29 @@ export class UniswapTrader {
     });
 
     const receipt = await tx.wait();
-    const gasUsed = receipt.gasUsed;
-    const gasPrice = receipt.gasPrice || 0n;
-    const gasCostEth = parseFloat(ethers.formatEther(gasUsed * gasPrice));
+    const gasCostEth = this.extractGasCostEth(receipt);
+    const actualAmountOut = this.decodeSwapOutput(receipt, quoteTokenAddress, quoteDecimals);
 
     logger.info('Uniswap sell IDOS confirmed', {
       txHash: receipt.hash,
-      gasUsed: gasUsed.toString(),
+      gasUsed: receipt.gasUsed.toString(),
       gasCostEth,
+      actualAmountOut,
       latencyMs: Date.now() - startTime,
     });
+
+    // Use actual output if decoded, otherwise fall back to estimate
+    const totalUsd = actualAmountOut > 0 ? actualAmountOut : amountIdos * expectedPriceUsd;
+    const effectivePrice = totalUsd / amountIdos;
 
     return {
       success: true,
       venue: 'uniswap_v3',
       direction: 'sell',
       amountIdos,
-      priceUsd: expectedPriceUsd,
-      totalUsd: amountIdos * expectedPriceUsd,
-      feeUsd: gasCostEth * expectedPriceUsd, // Approximate
+      priceUsd: effectivePrice,
+      totalUsd,
+      feeUsd: this.getGasFeeUsd(gasCostEth),
       txHash: receipt.hash,
       timestamp: Date.now(),
     };
@@ -158,7 +185,6 @@ export class UniswapTrader {
   ): Promise<TradeResult> {
     const amountOut = ethers.parseUnits(amountIdos.toFixed(idosDecimals), idosDecimals);
 
-    // Calculate max input with slippage
     const expectedInput = amountIdos * expectedPriceUsd;
     const slippageFactor = 1 + (config.trading.maxSlippagePct / 100);
     const maxAmountIn = ethers.parseUnits(
@@ -166,7 +192,6 @@ export class UniswapTrader {
       quoteDecimals,
     );
 
-    // Ensure approval
     await this.ensureApproval(quoteTokenAddress, maxAmountIn);
 
     const deadline = Math.floor(Date.now() / 1000) + 60;
@@ -190,32 +215,37 @@ export class UniswapTrader {
     });
 
     const receipt = await tx.wait();
-    const gasUsed = receipt.gasUsed;
-    const gasPrice = receipt.gasPrice || 0n;
-    const gasCostEth = parseFloat(ethers.formatEther(gasUsed * gasPrice));
+    const gasCostEth = this.extractGasCostEth(receipt);
+    // For buy (exactOutput), decode how much quote token was actually spent
+    const actualAmountSpent = this.decodeSwapInput(receipt, quoteTokenAddress, quoteDecimals);
 
     logger.info('Uniswap buy IDOS confirmed', {
       txHash: receipt.hash,
-      gasUsed: gasUsed.toString(),
+      gasUsed: receipt.gasUsed.toString(),
       gasCostEth,
+      actualAmountSpent,
       latencyMs: Date.now() - startTime,
     });
+
+    const totalUsd = actualAmountSpent > 0 ? actualAmountSpent : amountIdos * expectedPriceUsd;
+    const effectivePrice = totalUsd / amountIdos;
 
     return {
       success: true,
       venue: 'uniswap_v3',
       direction: 'buy',
       amountIdos,
-      priceUsd: expectedPriceUsd,
-      totalUsd: amountIdos * expectedPriceUsd,
-      feeUsd: gasCostEth * expectedPriceUsd,
+      priceUsd: effectivePrice,
+      totalUsd,
+      feeUsd: this.getGasFeeUsd(gasCostEth),
       txHash: receipt.hash,
       timestamp: Date.now(),
     };
   }
 
   /**
-   * Direct token-to-token swap (for triangular arb 3rd leg: e.g. WETH→USDC or USDC→WETH)
+   * Direct token-to-token swap (for triangular arb 3rd leg: e.g. WETH→USDC or USDC→WETH).
+   * Returns actual output amount decoded from Swap event logs.
    */
   async swapTokens(
     tokenIn: PoolToken,
@@ -235,8 +265,7 @@ export class UniswapTrader {
 
       await this.ensureApproval(tokenInAddress, amountInWei);
 
-      // Estimate output: for WETH→USDC, output ≈ amountIn * ethPrice
-      // For USDC→WETH, output ≈ amountIn / ethPrice
+      // Estimate output for slippage protection
       const expectedOutput = tokenIn === 'WETH'
         ? amountIn * ethPriceUsd
         : amountIn / ethPriceUsd;
@@ -268,14 +297,14 @@ export class UniswapTrader {
       });
 
       const receipt = await tx.wait();
-      const gasUsed = receipt.gasUsed;
-      const gasPrice = receipt.gasPrice || 0n;
-      const gasCostEth = parseFloat(ethers.formatEther(gasUsed * gasPrice));
+      const gasCostEth = this.extractGasCostEth(receipt);
+      const actualAmountOut = this.decodeSwapOutput(receipt, tokenOutAddress, tokenOutDecimals);
 
       logger.info(`Swap ${tokenIn}→${tokenOut} confirmed`, {
         txHash: receipt.hash,
-        gasUsed: gasUsed.toString(),
+        gasUsed: receipt.gasUsed.toString(),
         gasCostEth,
+        actualAmountOut,
         latencyMs: Date.now() - startTime,
       });
 
@@ -284,7 +313,7 @@ export class UniswapTrader {
         tokenIn,
         tokenOut,
         amountIn,
-        amountOut: expectedOutput, // Approximate; exact value from logs would be better
+        amountOut: actualAmountOut > 0 ? actualAmountOut : expectedOutput,
         txHash: receipt.hash,
         feeUsd: gasCostEth * ethPriceUsd,
         timestamp: Date.now(),
@@ -310,11 +339,86 @@ export class UniswapTrader {
     }
   }
 
+  /**
+   * Extract gas cost in ETH from a transaction receipt.
+   */
+  private extractGasCostEth(receipt: ethers.TransactionReceipt): number {
+    const gasUsed = receipt.gasUsed;
+    const gasPrice = receipt.gasPrice || 0n;
+    return parseFloat(ethers.formatEther(gasUsed * gasPrice));
+  }
+
+  /**
+   * Decode the actual output amount from Uniswap V3 Swap event logs.
+   * The Swap event emits amount0 and amount1 — one is negative (token out), one is positive (token in).
+   * We find the output token and return its absolute value.
+   */
+  private decodeSwapOutput(
+    receipt: ethers.TransactionReceipt,
+    outputTokenAddress: string,
+    outputDecimals: number,
+  ): number {
+    try {
+      for (const log of receipt.logs) {
+        try {
+          const parsed = poolIface.parseLog({ topics: [...log.topics], data: log.data });
+          if (parsed && parsed.name === 'Swap') {
+            const amount0 = parsed.args.amount0 as bigint;
+            const amount1 = parsed.args.amount1 as bigint;
+
+            // In Uniswap V3 Swap events: negative = token leaving pool (= received by user)
+            // We need to figure out which token is token0/token1 in this pool
+            // The simpler approach: return the absolute value of the negative amount
+            // using the output token's decimals
+            const negativeAmount = amount0 < 0n ? amount0 : amount1;
+            const absAmount = negativeAmount < 0n ? -negativeAmount : negativeAmount;
+            return parseFloat(ethers.formatUnits(absAmount, outputDecimals));
+          }
+        } catch {
+          // Not a Swap event from this interface, skip
+        }
+      }
+    } catch (err) {
+      logger.debug('Could not decode Swap event', { error: String(err) });
+    }
+    return 0; // Fallback: caller uses estimate
+  }
+
+  /**
+   * Decode the actual input amount spent from Swap event (for exactOutput swaps).
+   */
+  private decodeSwapInput(
+    receipt: ethers.TransactionReceipt,
+    inputTokenAddress: string,
+    inputDecimals: number,
+  ): number {
+    try {
+      for (const log of receipt.logs) {
+        try {
+          const parsed = poolIface.parseLog({ topics: [...log.topics], data: log.data });
+          if (parsed && parsed.name === 'Swap') {
+            const amount0 = parsed.args.amount0 as bigint;
+            const amount1 = parsed.args.amount1 as bigint;
+
+            // Positive amount = token going into the pool (= spent by user)
+            const positiveAmount = amount0 > 0n ? amount0 : amount1;
+            return parseFloat(ethers.formatUnits(positiveAmount, inputDecimals));
+          }
+        } catch {
+          // Skip non-Swap logs
+        }
+      }
+    } catch (err) {
+      logger.debug('Could not decode Swap input', { error: String(err) });
+    }
+    return 0;
+  }
+
   private async ensureApproval(tokenAddress: string, amount: bigint): Promise<void> {
-    const key = `${tokenAddress}_${config.uniswap.swapRouter}`;
+    const key = `${tokenAddress.toLowerCase()}_${config.uniswap.swapRouter.toLowerCase()}`;
     if (this.approvedTokens.has(key)) return;
 
-    const token = new ethers.Contract(tokenAddress, ERC20_ABI, this.wallet);
+    const token = new ethers.Contract(tokenAddress, ERC20_ABI, this.signer);
     const currentAllowance = await token.allowance(
       this.wallet.address,
       config.uniswap.swapRouter,

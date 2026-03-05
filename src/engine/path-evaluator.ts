@@ -93,9 +93,8 @@ function generateTriangularPaths(): ArbPath[] {
   const paths: ArbPath[] = [];
   const feeTiers: FeeTier[] = [3000, 10000];
 
-  // WETH/USDC pool fee tier for the 3rd leg (0.05% = 500 is standard, but we use 3000 as fallback)
-  // On Arbitrum the main WETH/USDC pools are 500 (0.05%) and 3000 (0.3%)
-  const thirdLegFeeTiers: FeeTier[] = [3000];
+  // WETH/USDC pool fee tier for the 3rd leg — 500 (0.05%) is the deepest liquidity on Arbitrum
+  const thirdLegFeeTiers: FeeTier[] = [500];
 
   for (const buyFee of feeTiers) {
     for (const sellFee of feeTiers) {
