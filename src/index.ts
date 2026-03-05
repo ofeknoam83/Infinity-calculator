@@ -238,6 +238,7 @@ class ArbitrageBot {
       currentPrices: this.aggregator.getAllPrices(),
       currentSpread: this.detector.getCurrentSpreads(),
       errors: this.errors,
+      tradeHistory: this.balanceTracker.getTradeHistory(),
     };
   }
 

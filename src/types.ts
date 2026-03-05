@@ -133,6 +133,7 @@ export interface BotStatus {
   currentPrices: NormalizedPrice[];
   currentSpread: { pathId: string; spreadPct: number }[];
   errors: { message: string; timestamp: number }[];
+  tradeHistory: TradeRecord[];
 }
 
 export interface TradeRecord {
