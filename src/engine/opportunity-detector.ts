@@ -14,6 +14,7 @@ export class OpportunityDetector extends EventEmitter {
   private locked = false;
   private kucoinAvailable = true;
   private availableUniswapPools = new Set<string>(); // "USDC_3000", "WETH_10000", etc.
+  private availableThirdLegFeeTiers = new Set<FeeTier>();
 
   constructor(aggregator: PriceAggregator, feeCalculator: FeeCalculator) {
     super();
@@ -39,6 +40,17 @@ export class OpportunityDetector extends EventEmitter {
     if (!available) {
       logger.info('KuCoin unavailable — disabling CEX-DEX paths');
     }
+  }
+
+  /**
+   * Register which Uniswap pools actually exist after pool discovery.
+   * Paths referencing non-existent pools will be pruned.
+   */
+  /**
+   * Register available WETH/USDC fee tiers for triangular 3rd leg pruning.
+   */
+  setAvailableThirdLegFeeTiers(feeTiers: FeeTier[]): void {
+    this.availableThirdLegFeeTiers = new Set(feeTiers);
   }
 
   /**
@@ -82,6 +94,12 @@ export class OpportunityDetector extends EventEmitter {
     // Check sell-side Uniswap pool
     if (path.sellVenue === 'uniswap_v3' && path.sellQuoteToken && path.sellFeeTier) {
       if (!this.availableUniswapPools.has(`${path.sellQuoteToken}_${path.sellFeeTier}`)) {
+        return false;
+      }
+    }
+    // Check 3rd leg (triangular: WETH/USDC pool at specific fee tier)
+    if (path.pathType === 'triangular' && path.thirdLegFeeTier) {
+      if (this.availableThirdLegFeeTiers.size > 0 && !this.availableThirdLegFeeTiers.has(path.thirdLegFeeTier)) {
         return false;
       }
     }

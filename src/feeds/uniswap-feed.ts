@@ -123,7 +123,41 @@ export class UniswapFeed extends EventEmitter {
       }
     }
 
-    logger.info(`Discovered ${this.pools.length} Uniswap V3 pools`);
+    logger.info(`Discovered ${this.pools.length} Uniswap V3 IDOS pools`);
+
+    // Also discover WETH/USDC pools (used as 3rd leg in triangular arb)
+    await this.discoverThirdLegPools();
+  }
+
+  /**
+   * Discover which WETH/USDC fee tiers exist (for triangular 3rd leg).
+   * We only need to know they exist — we don't poll prices for them.
+   */
+  private availableThirdLegFeeTiers: FeeTier[] = [];
+
+  private async discoverThirdLegPools(): Promise<void> {
+    for (const fee of config.uniswap.feeTiers) {
+      try {
+        const poolAddress = await this.factory.getPool(
+          config.tokens.WETH,
+          config.tokens.USDC,
+          fee,
+        );
+        if (poolAddress !== ethers.ZeroAddress) {
+          this.availableThirdLegFeeTiers.push(fee as FeeTier);
+          logger.info(`Discovered WETH/USDC pool fee=${fee / 10000}%`, { pool: poolAddress });
+        } else {
+          logger.debug(`No WETH/USDC pool found: fee=${fee}`);
+        }
+      } catch (err) {
+        logger.error(`Error discovering WETH/USDC pool fee=${fee}`, { error: String(err) });
+      }
+    }
+    logger.info(`Available WETH/USDC 3rd-leg fee tiers: ${this.availableThirdLegFeeTiers.join(', ') || 'none'}`);
+  }
+
+  getAvailableThirdLegFeeTiers(): FeeTier[] {
+    return [...this.availableThirdLegFeeTiers];
   }
 
   private async pollPrices(): Promise<void> {

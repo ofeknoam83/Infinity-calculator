@@ -1,10 +1,11 @@
 import { ArbPath, FeeTier, PoolToken } from '../types';
+import { config } from '../config';
 
 /**
- * Generate all possible arbitrage paths:
- * 1. CEX-DEX: KuCoin ↔ Uniswap V3 (8 paths)
- * 2. Cross-DEX: Uniswap USDC pool ↔ Uniswap WETH pool (8 paths)
- * 3. Triangular: USDC→IDOS→WETH→USDC and WETH→IDOS→USDC→WETH (8 paths)
+ * Generate all possible arbitrage paths across all configured fee tiers.
+ * Non-existent pools will be pruned by OpportunityDetector at startup
+ * after Uniswap pool discovery completes — so it's safe to generate
+ * paths for fee tiers that may not have pools deployed.
  */
 export function generateArbPaths(): ArbPath[] {
   return [
@@ -17,7 +18,7 @@ export function generateArbPaths(): ArbPath[] {
 function generateCexDexPaths(): ArbPath[] {
   const paths: ArbPath[] = [];
   const quoteTokens: PoolToken[] = ['USDC', 'WETH'];
-  const feeTiers: FeeTier[] = [3000, 10000];
+  const feeTiers = config.uniswap.feeTiers;
 
   for (const qt of quoteTokens) {
     for (const fee of feeTiers) {
@@ -29,7 +30,7 @@ function generateCexDexPaths(): ArbPath[] {
         sellVenue: 'uniswap_v3',
         buyPair: 'IDOS/USDT',
         sellPair: `IDOS/${qt}`,
-        sellFeeTier: fee,
+        sellFeeTier: fee as FeeTier,
         sellQuoteToken: qt,
       });
 
@@ -41,7 +42,7 @@ function generateCexDexPaths(): ArbPath[] {
         sellVenue: 'kucoin',
         buyPair: `IDOS/${qt}`,
         sellPair: 'IDOS/USDT',
-        buyFeeTier: fee,
+        buyFeeTier: fee as FeeTier,
         buyQuoteToken: qt,
       });
     }
@@ -52,7 +53,7 @@ function generateCexDexPaths(): ArbPath[] {
 
 function generateCrossDexPaths(): ArbPath[] {
   const paths: ArbPath[] = [];
-  const feeTiers: FeeTier[] = [3000, 10000];
+  const feeTiers = config.uniswap.feeTiers;
 
   for (const buyFee of feeTiers) {
     for (const sellFee of feeTiers) {
@@ -64,8 +65,8 @@ function generateCrossDexPaths(): ArbPath[] {
         sellVenue: 'uniswap_v3',
         buyPair: 'IDOS/USDC',
         sellPair: 'IDOS/WETH',
-        buyFeeTier: buyFee,
-        sellFeeTier: sellFee,
+        buyFeeTier: buyFee as FeeTier,
+        sellFeeTier: sellFee as FeeTier,
         buyQuoteToken: 'USDC',
         sellQuoteToken: 'WETH',
       });
@@ -78,8 +79,8 @@ function generateCrossDexPaths(): ArbPath[] {
         sellVenue: 'uniswap_v3',
         buyPair: 'IDOS/WETH',
         sellPair: 'IDOS/USDC',
-        buyFeeTier: buyFee,
-        sellFeeTier: sellFee,
+        buyFeeTier: buyFee as FeeTier,
+        sellFeeTier: sellFee as FeeTier,
         buyQuoteToken: 'WETH',
         sellQuoteToken: 'USDC',
       });
@@ -91,15 +92,16 @@ function generateCrossDexPaths(): ArbPath[] {
 
 function generateTriangularPaths(): ArbPath[] {
   const paths: ArbPath[] = [];
-  const feeTiers: FeeTier[] = [3000, 10000];
+  const feeTiers = config.uniswap.feeTiers;
 
-  // WETH/USDC pool fee tier for the 3rd leg — 500 (0.05%) is the deepest liquidity on Arbitrum
-  const thirdLegFeeTiers: FeeTier[] = [500];
+  // 3rd leg (WETH↔USDC) also tries all fee tiers — the 500 (0.05%) pool
+  // has deepest liquidity for major pairs, but we generate all and prune at runtime.
+  const thirdLegFeeTiers = config.uniswap.feeTiers;
 
   for (const buyFee of feeTiers) {
     for (const sellFee of feeTiers) {
       for (const thirdFee of thirdLegFeeTiers) {
-        // Triangular: USDC → IDOS (buy on USDC pool) → WETH (sell on WETH pool) → USDC (swap WETH→USDC)
+        // Triangular: USDC → IDOS → WETH → USDC
         paths.push({
           id: `tri__USDC_${buyFee}__WETH_${sellFee}__back_${thirdFee}`,
           pathType: 'triangular',
@@ -107,16 +109,16 @@ function generateTriangularPaths(): ArbPath[] {
           sellVenue: 'uniswap_v3',
           buyPair: 'IDOS/USDC',
           sellPair: 'IDOS/WETH',
-          buyFeeTier: buyFee,
-          sellFeeTier: sellFee,
+          buyFeeTier: buyFee as FeeTier,
+          sellFeeTier: sellFee as FeeTier,
           buyQuoteToken: 'USDC',
           sellQuoteToken: 'WETH',
           thirdLegTokenIn: 'WETH',
           thirdLegTokenOut: 'USDC',
-          thirdLegFeeTier: thirdFee,
+          thirdLegFeeTier: thirdFee as FeeTier,
         });
 
-        // Triangular: WETH → IDOS (buy on WETH pool) → USDC (sell on USDC pool) → WETH (swap USDC→WETH)
+        // Triangular: WETH → IDOS → USDC → WETH
         paths.push({
           id: `tri__WETH_${buyFee}__USDC_${sellFee}__back_${thirdFee}`,
           pathType: 'triangular',
@@ -124,13 +126,13 @@ function generateTriangularPaths(): ArbPath[] {
           sellVenue: 'uniswap_v3',
           buyPair: 'IDOS/WETH',
           sellPair: 'IDOS/USDC',
-          buyFeeTier: buyFee,
-          sellFeeTier: sellFee,
+          buyFeeTier: buyFee as FeeTier,
+          sellFeeTier: sellFee as FeeTier,
           buyQuoteToken: 'WETH',
           sellQuoteToken: 'USDC',
           thirdLegTokenIn: 'USDC',
           thirdLegTokenOut: 'WETH',
-          thirdLegFeeTier: thirdFee,
+          thirdLegFeeTier: thirdFee as FeeTier,
         });
       }
     }

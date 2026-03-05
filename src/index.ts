@@ -98,6 +98,10 @@ class ArbitrageBot {
       this.detector.setAvailableUniswapPools(
         discoveredPools.map(p => ({ quoteToken: p.quoteToken, fee: p.fee })),
       );
+      // Also tell it which WETH/USDC fee tiers exist for triangular 3rd leg
+      this.detector.setAvailableThirdLegFeeTiers(
+        this.uniswapFeed.getAvailableThirdLegFeeTiers(),
+      );
 
       // Check if we have any viable data sources
       const hasKucoin = this.kucoinFeed.isPairAvailable();
