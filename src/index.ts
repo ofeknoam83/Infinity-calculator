@@ -49,7 +49,7 @@ class ArbitrageBot {
 
     // Inventory
     this.balanceTracker = new BalanceTracker(this.kucoinTrader, this.uniswapTrader);
-    this.rebalancer = new Rebalancer();
+    this.rebalancer = new Rebalancer(this.kucoinTrader, this.uniswapTrader);
 
     // Dashboard
     this.dashboard = new Dashboard(() => this.getStatus());
@@ -68,12 +68,73 @@ class ArbitrageBot {
     this.running = true;
 
     try {
-      // Start feeds
-      await this.kucoinFeed.start();
-      await this.uniswapFeed.start();
+      // --- Start feeds (gracefully handle individual failures) ---
+
+      // Start KuCoin feed — if the pair doesn't exist, CEX-DEX paths are disabled
+      try {
+        await this.kucoinFeed.start();
+      } catch (err) {
+        logger.warn('KuCoin feed failed to start — CEX-DEX paths disabled', {
+          error: String(err),
+        });
+      }
+
+      // Inform detector about KuCoin availability
+      if (!this.kucoinFeed.isPairAvailable()) {
+        this.detector.setKucoinAvailable(false);
+      }
+
+      // Start Uniswap feed — discover pools
+      try {
+        await this.uniswapFeed.start();
+      } catch (err) {
+        logger.warn('Uniswap feed failed to start — DEX paths may be limited', {
+          error: String(err),
+        });
+      }
+
+      // Tell the detector which Uniswap pools actually exist so it prunes impossible paths
+      const discoveredPools = this.uniswapFeed.getDiscoveredPools();
+      this.detector.setAvailableUniswapPools(
+        discoveredPools.map(p => ({ quoteToken: p.quoteToken, fee: p.fee })),
+      );
+
+      // Check if we have any viable data sources
+      const hasKucoin = this.kucoinFeed.isPairAvailable();
+      const hasUniswap = discoveredPools.length > 0;
+      if (!hasKucoin && !hasUniswap) {
+        logger.error('No price data sources available — bot cannot trade');
+        logger.error('Neither KuCoin pair nor Uniswap pools are available.');
+        // Don't throw — keep running in case things come online later
+      } else {
+        const sources: string[] = [];
+        if (hasKucoin) sources.push('KuCoin');
+        if (hasUniswap) sources.push(`Uniswap (${discoveredPools.length} pools)`);
+        logger.info(`Active data sources: ${sources.join(', ')}`);
+      }
+
+      // Start aggregator
       await this.aggregator.start();
 
-      // Start engine
+      // --- Balance tracking ---
+      await this.balanceTracker.start();
+
+      // --- Initial bootstrap: distribute funds if starting from KuCoin-only ---
+      const initialBalances = this.balanceTracker.getBalances();
+      logger.info('Initial balances', { balances: initialBalances });
+
+      try {
+        await this.rebalancer.bootstrap(initialBalances);
+      } catch (err) {
+        logger.warn('Bootstrap failed — continuing with current balances', {
+          error: String(err),
+        });
+      }
+
+      // Refresh balances after bootstrap
+      await this.balanceTracker.refresh();
+
+      // --- Start engine ---
       this.detector.start();
 
       // Wire up gas price and ETH price updates
@@ -84,19 +145,25 @@ class ArbitrageBot {
         this.uniswapTrader.updateEthPrice(this.aggregator.getEthPriceUsd());
       }, config.intervals.gasPricePollMs);
 
-      // Start balance tracking
-      await this.balanceTracker.start();
-
-      // Periodic rebalance checks
-      setInterval(() => {
-        const balances = this.balanceTracker.getBalances();
-        this.rebalancer.checkRebalanceNeeded(balances);
+      // --- Periodic auto-rebalancing ---
+      setInterval(async () => {
+        if (this.executor.isExecuting() || this.rebalancer.isRebalancing()) return;
+        try {
+          const balances = this.balanceTracker.getBalances();
+          await this.rebalancer.checkAndRebalance(balances);
+        } catch (err) {
+          logger.error('Rebalance check failed', { error: String(err) });
+        }
       }, 60_000);
 
-      // Wire up opportunity detection → execution
+      // --- Wire up opportunity detection → execution ---
       this.detector.on('opportunity', async (opp: ArbOpportunity) => {
         if (this.executor.isExecuting()) {
           logger.debug('Skipping opportunity — execution in progress');
+          return;
+        }
+        if (this.rebalancer.isRebalancing()) {
+          logger.debug('Skipping opportunity — rebalancing in progress');
           return;
         }
 
@@ -123,10 +190,6 @@ class ArbitrageBot {
       this.dashboard.start();
 
       logger.info('=== Bot fully initialized and running ===');
-
-      // Log initial balances
-      const balances = this.balanceTracker.getBalances();
-      logger.info('Initial balances', { balances });
     } catch (err) {
       const errorMsg = err instanceof Error ? err.message : String(err);
       logger.error('Fatal error during startup', { error: errorMsg });

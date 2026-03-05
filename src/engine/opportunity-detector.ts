@@ -4,7 +4,7 @@ import { FeeCalculator } from './fee-calculator';
 import { generateArbPaths, getPathDescription } from './path-evaluator';
 import { config } from '../config';
 import { logger } from '../utils/logger';
-import { ArbOpportunity, ArbPath, NormalizedPrice } from '../types';
+import { ArbOpportunity, ArbPath, NormalizedPrice, PoolToken, FeeTier } from '../types';
 
 export class OpportunityDetector extends EventEmitter {
   private aggregator: PriceAggregator;
@@ -12,6 +12,8 @@ export class OpportunityDetector extends EventEmitter {
   private paths: ArbPath[];
   private lastTradeAt = 0;
   private locked = false;
+  private kucoinAvailable = true;
+  private availableUniswapPools = new Set<string>(); // "USDC_3000", "WETH_10000", etc.
 
   constructor(aggregator: PriceAggregator, feeCalculator: FeeCalculator) {
     super();
@@ -22,11 +24,68 @@ export class OpportunityDetector extends EventEmitter {
     const cexDex = this.paths.filter(p => p.pathType === 'cex_dex').length;
     const crossDex = this.paths.filter(p => p.pathType === 'cross_dex').length;
     const triangular = this.paths.filter(p => p.pathType === 'triangular').length;
-    logger.info(`Initialized ${this.paths.length} arbitrage paths`, {
+    logger.info(`Generated ${this.paths.length} arbitrage paths (pre-filtering)`, {
       cexDex,
       crossDex,
       triangular,
     });
+  }
+
+  /**
+   * Mark KuCoin as unavailable — all CEX-DEX paths will be skipped.
+   */
+  setKucoinAvailable(available: boolean): void {
+    this.kucoinAvailable = available;
+    if (!available) {
+      logger.info('KuCoin unavailable — disabling CEX-DEX paths');
+    }
+  }
+
+  /**
+   * Register which Uniswap pools actually exist after pool discovery.
+   * Paths referencing non-existent pools will be pruned.
+   */
+  setAvailableUniswapPools(pools: { quoteToken: PoolToken; fee: FeeTier }[]): void {
+    this.availableUniswapPools.clear();
+    for (const p of pools) {
+      this.availableUniswapPools.add(`${p.quoteToken}_${p.fee}`);
+    }
+
+    // Prune paths that reference non-existent pools
+    const before = this.paths.length;
+    this.paths = this.paths.filter(path => this.isPathViable(path));
+    const after = this.paths.length;
+
+    if (before !== after) {
+      logger.info(`Pruned ${before - after} paths with non-existent pools`, {
+        remaining: after,
+        availablePools: [...this.availableUniswapPools],
+      });
+    }
+
+    const cexDex = this.paths.filter(p => p.pathType === 'cex_dex').length;
+    const crossDex = this.paths.filter(p => p.pathType === 'cross_dex').length;
+    const triangular = this.paths.filter(p => p.pathType === 'triangular').length;
+    logger.info(`Active arbitrage paths: ${this.paths.length}`, { cexDex, crossDex, triangular });
+  }
+
+  /**
+   * Check if a path's required pools actually exist.
+   */
+  private isPathViable(path: ArbPath): boolean {
+    // Check buy-side Uniswap pool
+    if (path.buyVenue === 'uniswap_v3' && path.buyQuoteToken && path.buyFeeTier) {
+      if (!this.availableUniswapPools.has(`${path.buyQuoteToken}_${path.buyFeeTier}`)) {
+        return false;
+      }
+    }
+    // Check sell-side Uniswap pool
+    if (path.sellVenue === 'uniswap_v3' && path.sellQuoteToken && path.sellFeeTier) {
+      if (!this.availableUniswapPools.has(`${path.sellQuoteToken}_${path.sellFeeTier}`)) {
+        return false;
+      }
+    }
+    return true;
   }
 
   start(): void {
@@ -48,7 +107,7 @@ export class OpportunityDetector extends EventEmitter {
     if (Date.now() - this.lastTradeAt < config.trading.cooldownMs) return;
 
     const prices = this.aggregator.getAllPrices();
-    if (prices.length < 2) return;
+    if (prices.length === 0) return;
 
     this.feeCalculator.updateEthPrice(this.aggregator.getEthPriceUsd());
 
@@ -57,16 +116,20 @@ export class OpportunityDetector extends EventEmitter {
     const depeg = this.aggregator.isDepegDetected();
 
     for (const path of this.paths) {
-      // Skip CEX-DEX paths during stablecoin depeg (USDT vs USDC divergence)
-      if (depeg && path.pathType === 'cex_dex') continue;
+      // Skip CEX-DEX paths if KuCoin is unavailable or depeg detected
+      if (path.pathType === 'cex_dex' && (!this.kucoinAvailable || depeg)) continue;
 
       let opportunity: ArbOpportunity | null = null;
 
-      if (path.pathType === 'triangular') {
-        opportunity = this.evaluateTriangular(path, prices);
-      } else {
-        // CEX-DEX and cross-DEX use the same 2-leg evaluation
-        opportunity = this.evaluateTwoLeg(path, prices);
+      try {
+        if (path.pathType === 'triangular') {
+          opportunity = this.evaluateTriangular(path, prices);
+        } else {
+          opportunity = this.evaluateTwoLeg(path, prices);
+        }
+      } catch (err) {
+        // Never let a single path evaluation crash the loop
+        logger.debug(`Error evaluating path ${path.id}`, { error: String(err) });
       }
 
       if (opportunity && (!bestOpportunity || opportunity.netProfitUsd > bestOpportunity.netProfitUsd)) {
@@ -130,26 +193,12 @@ export class OpportunityDetector extends EventEmitter {
     };
   }
 
-  /**
-   * Triangular arb evaluation:
-   *   Leg 1: Spend quoteA to buy IDOS on pool A
-   *   Leg 2: Sell IDOS for quoteB on pool B
-   *   Leg 3: Swap quoteB back to quoteA
-   *
-   * Profit = (amount of quoteA received after full cycle) - (amount of quoteA spent)
-   *
-   * We use the normalized USD prices to estimate the cycle profit.
-   * The key insight: if buy price on USDC pool is lower than sell price on WETH pool
-   * (after converting WETH→USDC), there's a triangular arb.
-   */
   private evaluateTriangular(path: ArbPath, prices: NormalizedPrice[]): ArbOpportunity | null {
     const buyPrice = this.getPriceForLeg(path, 'buy', prices);
     const sellPrice = this.getPriceForLeg(path, 'sell', prices);
 
     if (!buyPrice || !sellPrice) return null;
 
-    // The spread in USD terms already accounts for the WETH→USD conversion
-    // The 3rd leg (WETH↔USDC swap) adds extra fee that we account for in FeeCalculator
     const spreadPct = ((sellPrice.sellPriceUsd - buyPrice.buyPriceUsd) / buyPrice.buyPriceUsd) * 100;
     if (spreadPct <= 0) return null;
 

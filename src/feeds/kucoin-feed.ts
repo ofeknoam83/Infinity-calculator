@@ -9,6 +9,7 @@ export class KuCoinFeed extends EventEmitter {
   private wsClient: WebsocketClient;
   private latestQuote: PriceQuote | null = null;
   private connected = false;
+  private pairAvailable = true;
 
   constructor() {
     super();
@@ -26,6 +27,14 @@ export class KuCoinFeed extends EventEmitter {
 
   async start(): Promise<void> {
     logger.info('Starting KuCoin price feed', { pair: config.kucoin.tradingPair });
+
+    // Verify pair exists via REST before subscribing to WS
+    const snapshotOk = await this.fetchRestSnapshot();
+    if (!snapshotOk) {
+      logger.warn(`KuCoin pair ${config.kucoin.tradingPair} not available — CEX-DEX paths disabled`);
+      this.pairAvailable = false;
+      return; // Don't subscribe WS for a pair that doesn't exist
+    }
 
     // Set up WebSocket event handlers
     this.wsClient.on('update', (data) => {
@@ -53,21 +62,30 @@ export class KuCoinFeed extends EventEmitter {
 
     // Subscribe to ticker for IDOS-USDT
     this.wsClient.subscribe(`/market/ticker:${config.kucoin.tradingPair}`, 'spotPublicV1');
-
-    // Fetch initial snapshot via REST
-    await this.fetchRestSnapshot();
   }
 
-  private async fetchRestSnapshot(): Promise<void> {
+  /**
+   * Fetch initial price snapshot via REST. Returns true if successful.
+   */
+  private async fetchRestSnapshot(): Promise<boolean> {
     try {
       const ticker = await this.spotClient.getTicker({ symbol: config.kucoin.tradingPair });
       if (ticker.data) {
         const data = ticker.data;
+        const bid = parseFloat(String(data.bestBid));
+        const ask = parseFloat(String(data.bestAsk));
+
+        // Sanity check — a zero-price response means the pair is inactive
+        if (bid <= 0 && ask <= 0) {
+          logger.warn('KuCoin pair has zero prices — treating as unavailable');
+          return false;
+        }
+
         this.latestQuote = {
           venue: 'kucoin',
           pair: 'IDOS/USDT',
-          bidPrice: parseFloat(String(data.bestBid)),
-          askPrice: parseFloat(String(data.bestAsk)),
+          bidPrice: bid,
+          askPrice: ask,
           bidSizeIdos: parseFloat(String(data.bestBidSize)),
           askSizeIdos: parseFloat(String(data.bestAskSize)),
           timestamp: Date.now(),
@@ -77,9 +95,12 @@ export class KuCoinFeed extends EventEmitter {
           bid: this.latestQuote.bidPrice,
           ask: this.latestQuote.askPrice,
         });
+        return true;
       }
+      return false;
     } catch (err) {
       logger.error('Failed to fetch KuCoin REST snapshot', { error: String(err) });
+      return false;
     }
   }
 
@@ -111,9 +132,15 @@ export class KuCoinFeed extends EventEmitter {
     return this.connected;
   }
 
+  isPairAvailable(): boolean {
+    return this.pairAvailable;
+  }
+
   async stop(): Promise<void> {
     logger.info('Stopping KuCoin price feed');
-    this.wsClient.closeAll();
+    if (this.pairAvailable) {
+      this.wsClient.closeAll();
+    }
     this.connected = false;
   }
 }
